@@ -6,29 +6,47 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
 jobs:
-  build:
-    name: Build & Vet
+  test:
+    name: Build, vet, test (Go ${{ matrix.go }})
     runs-on: ubuntu-latest
-
+    strategy:
+      matrix:
+        # Fabric v2.5.16 chaincode images ship Go 1.26.x; keep the module
+        # buildable there (go.mod says go 1.26.0) and on the latest Go.
+        go: ["1.26.x", "1.27.x"]
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up Go
-        uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
-          go-version: "1.21"
+          go-version: ${{ matrix.go }}
 
-      - name: Download dependencies
-        run: go mod download
+      - name: Verify module files are tidy
+        run: |
+          go mod tidy
+          git diff --exit-code go.mod go.sum
 
       - name: Vet
         run: go vet ./...
 
-      - name: Build
-        run: go build ./...
+      - name: Vet with the pkcs11 build tag (HSM support)
+        run: CGO_ENABLED=1 go vet -tags pkcs11 ./...
+
+      - name: Test with race detector
+        run: go test -race -count=1 ./...
 
       - name: Build examples
-        run: |
-          go build ./examples/basic/...
-          go build ./examples/events/...
+        run: go build ./examples/...
+
+  vulncheck:
+    name: govulncheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: "1.27.x"
+      - run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...

@@ -1,8 +1,8 @@
-// Command events demonstrates chaincode event listening with fabricsdk.
+// Command events listens to chaincode events with automatic reconnect and a
+// file checkpoint, so a restart resumes exactly where it stopped.
 //
-// Configure via environment variables (same as basic example) then run:
-//
-//	go run main.go
+// Use the same environment variables as examples/basic, then run
+// `go run ./examples/events`. Stop with Ctrl+C.
 package main
 
 import (
@@ -13,44 +13,43 @@ import (
 	"os/signal"
 	"syscall"
 
-	fabricsdk "github.com/muhammadtalha198/fabricsdk"
+	"github.com/muhammadtalha198/fabricsdk"
 )
 
 func main() {
-	cfg := fabricsdk.Config{
+	fc, err := fabricsdk.New(fabricsdk.Config{
 		PeerEndpoint:     mustEnv("PEER_ENDPOINT"),
-		PeerHostOverride: mustEnv("PEER_HOST_OVERRIDE"),
+		PeerHostOverride: os.Getenv("PEER_HOST_OVERRIDE"),
 		TLSCertPath:      mustEnv("TLS_CERT_PATH"),
 		CertPath:         mustEnv("CERT_PATH"),
 		KeyPath:          mustEnv("KEY_PATH"),
 		MSPID:            mustEnv("MSP_ID"),
 		ChannelName:      mustEnv("CHANNEL"),
 		ChaincodeName:    mustEnv("CHAINCODE"),
-	}
-
-	fc, err := fabricsdk.New(cfg)
+	})
 	if err != nil {
 		log.Fatalf("connect: %v", err)
 	}
 	defer fc.Close()
 
-	// Cancel on Ctrl+C
-	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer cancel()
-
-	fmt.Println("Listening for chaincode events. Press Ctrl+C to stop.")
-
-	events, err := fc.Events(ctx)
+	cp, err := fabricsdk.NewFileCheckpointer("checkpoint.json")
 	if err != nil {
-		log.Fatalf("events: %v", err)
+		log.Fatalf("checkpoint: %v", err)
 	}
+	defer cp.Close()
 
-	for ev := range events {
-		fmt.Printf("block=%-6d event=%-20s txID=%s payload=%s\n",
-			ev.BlockNumber, ev.EventName, ev.TxID[:8]+"...", ev.Payload)
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	fmt.Printf("listening from block %d (tx %q)\n", cp.BlockNumber(), cp.TransactionID())
+	err = fc.ListenChaincodeEvents(ctx, cp, func(_ context.Context, ev fabricsdk.ChaincodeEvent) error {
+		fmt.Printf("block=%d tx=%s event=%s payload=%s\n", ev.BlockNumber, ev.TxID, ev.EventName, ev.Payload)
+		return nil
+	}, fabricsdk.FromBlock(0))
+	if err != nil {
+		log.Fatalf("listener stopped: %v", err)
 	}
-
-	fmt.Println("Event stream closed.")
+	fmt.Println("stopped")
 }
 
 func mustEnv(key string) string {

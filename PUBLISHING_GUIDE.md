@@ -188,3 +188,24 @@ go get github.com/muhammadtalha198/fabricsdk@v0.1.0
 ```
 
 After these 4 steps, your SDK is live.
+
+---
+
+## Releasing a new version (v0.2.0 and later)
+
+1. Merge the release branch into `main` and make sure CI is green.
+2. Check the CHANGELOG entry for the version.
+3. Tag and push. **A pushed tag is permanent**: the Go module proxy caches it
+   forever, even if you delete the tag later. If a release is broken, publish
+   a new patch version and add a `retract` directive to `go.mod`.
+
+```bash
+git checkout main && git pull
+git tag -a v0.2.0 -m "fabricsdk v0.2.0"
+git push origin v0.2.0
+GOPROXY=proxy.golang.org go list -m github.com/muhammadtalha198/fabricsdk@v0.2.0
+```
+
+4. Create a GitHub release from the tag and paste the CHANGELOG section.
+5. Update consumers. For example, an API on v0.1.0 needs the code changes in
+   the CHANGELOG migration table, then `go get github.com/muhammadtalha198/fabricsdk@v0.2.0`.

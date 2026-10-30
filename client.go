@@ -1,454 +1,324 @@
-// Package fabricsdk provides a simple, ethers.js-style client for
-// Hyperledger Fabric. It handles gRPC connections, TLS, x509 identity
-// loading, transaction submission, and commit waiting — so application
-// code only needs to call Evaluate (read) or Submit (write).
+// Package fabricsdk is a small, ethers.js-style Go client for Hyperledger
+// Fabric v2.4+ built on the official Fabric Gateway client
+// (github.com/hyperledger/fabric-gateway).
 //
-// # Quickstart
-//
-//	cfg := fabricsdk.Config{
-//	    PeerEndpoint:     "localhost:7051",
-//	    PeerHostOverride: "peer0.org1.example.com",
-//	    TLSCertPath:      "/path/to/peer-tls-ca.pem",    // peer TLS CA cert file
-//	    CertPath:         "/path/to/msp/signcerts",       // directory with signing cert
-//	    KeyPath:          "/path/to/msp/keystore",        // directory with private key
-//	    MSPID:            "Org1MSP",
-//	    ChannelName:      "mychannel",
-//	    ChaincodeName:    "mychaincode",
-//	    ContractName:     "MyContract",  // leave empty for default contract
-//	}
+// Call Evaluate for reads and Submit for writes; the SDK handles TLS, gRPC,
+// identity, endorsement, ordering and commit waiting:
 //
 //	fc, err := fabricsdk.New(cfg)
 //	if err != nil { ... }
 //	defer fc.Close()
 //
-//	ctx := context.Background()
+//	raw, err := fc.Evaluate(ctx, "ReadAsset", "asset1")
+//	res, err := fc.Submit(ctx, "CreateAsset", "asset2", "blue")
+//	fmt.Println(res.TxID, res.BlockNumber)
 //
-//	// Read — EvaluateTransaction, no ledger write
-//	raw, err := fc.Evaluate(ctx, "GetAsset", "asset-1")
+// Everything honours the context: a deadline or cancellation on ctx bounds the
+// call. When ctx has no deadline, each phase uses its Config timeout.
 //
-//	// Write — SubmitAsync + commit wait, returns txID
-//	txID, err := fc.Submit(ctx, "CreateAsset", string(jsonBytes))
+// For private data, pass inputs as transient data and, when needed, choose the
+// endorsing organizations:
 //
-//	// Different caller identity for one call
-//	txID, err = fc.WithIdentity("/admin/signcerts", "/admin/keystore").Submit(ctx, "AdminFn", arg)
+//	res, err := fc.SubmitWith(ctx, "CreateChallan",
+//	    fabricsdk.Args(challanID),
+//	    fabricsdk.Transient(map[string][]byte{"owner": ownerJSON}),
+//	)
+//
+// To act as another user (for example one Fabric identity per officer), load
+// the Identity once and reuse it; every call shares the client's single gRPC
+// connection:
+//
+//	officer, err := fabricsdk.LoadIdentity("PoliceMSP", certFile, keyFile)
+//	res, err := fc.WithIdentity(officer).Submit(ctx, "IssueChallan", id)
+//
+// Errors are *Error values with a Kind. A write that fails after reaching the
+// orderer is reported with OutcomeUnknown and its TxID; resolve it with
+// TxStatus instead of resubmitting.
 package fabricsdk
 
 import (
 	"context"
+	"crypto/sha256"
+	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"os"
-	"path"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/hyperledger/fabric-gateway/pkg/client"
 	"github.com/hyperledger/fabric-gateway/pkg/hash"
-	"github.com/hyperledger/fabric-gateway/pkg/identity"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 )
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Logger interface — optional structured logging hook
-// ─────────────────────────────────────────────────────────────────────────────
-
-// Logger is an optional logging interface you can inject into the SDK.
-// If nil, all logging is suppressed. Compatible with zap.SugaredLogger,
-// logrus.Entry, slog, or any custom adapter.
-//
-//	type zapAdapter struct{ l *zap.SugaredLogger }
-//	func (a *zapAdapter) Info(msg string, kv ...any)  { a.l.Infow(msg, kv...) }
-//	func (a *zapAdapter) Error(msg string, kv ...any) { a.l.Errorw(msg, kv...) }
-//
-//	cfg.Logger = &zapAdapter{l: logger.Sugar()}
-type Logger interface {
-	Info(msg string, keysAndValues ...any)
-	Error(msg string, keysAndValues ...any)
-}
-
-// noopLogger swallows all log calls when no Logger is configured.
-type noopLogger struct{}
-
-func (noopLogger) Info(string, ...any)  {}
-func (noopLogger) Error(string, ...any) {}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Config
-// ─────────────────────────────────────────────────────────────────────────────
-
-// Config holds every parameter needed to connect to a Fabric peer and target
-// a chaincode. Construct it from environment variables, YAML, flags, or
-// hardcoded values — the SDK does not care how you populate it.
-type Config struct {
-	// ── Network ──────────────────────────────────────────────────────────────
-	// PeerEndpoint is the host:port of the peer gRPC endpoint.
-	// Example: "localhost:7051" or "peer0.org1.example.com:7051"
-	PeerEndpoint string
-
-	// PeerHostOverride is the TLS SNI hostname sent during the TLS handshake.
-	// Required when PeerEndpoint is an IP or differs from the cert's CN/SAN.
-	// Example: "peer0.org1.example.com"
-	PeerHostOverride string
-
-	// TLSCertPath is the path to the peer's TLS CA certificate PEM file.
-	// Used to verify the peer's TLS certificate.
-	TLSCertPath string
-
-	// ── Caller identity (default) ────────────────────────────────────────────
-	// CertPath is a directory containing the x509 signing certificate PEM file.
-	// Fabric MSP signcerts directories hold exactly one file — this SDK reads it.
-	CertPath string
-
-	// KeyPath is a directory containing the private key PEM file corresponding
-	// to the signing certificate. Fabric MSP keystore directories hold one file.
-	KeyPath string
-
-	// MSPID is the Membership Service Provider identifier for the caller's org.
-	// Example: "Org1MSP"
-	MSPID string
-
-	// ── Chaincode target ─────────────────────────────────────────────────────
-	// ChannelName is the Fabric channel the chaincode is deployed on.
-	ChannelName string
-
-	// ChaincodeName is the name the chaincode was deployed with.
-	ChaincodeName string
-
-	// ContractName is the named contract inside the chaincode.
-	// Leave empty to use the default (unnamed) contract.
-	ContractName string
-
-	// ── Timeouts (zero = library defaults) ───────────────────────────────────
-	EvaluateTimeout     time.Duration // default: 5s
-	EndorseTimeout      time.Duration // default: 15s
-	SubmitTimeout       time.Duration // default: 5s
-	CommitStatusTimeout time.Duration // default: 60s
-
-	// ── Optional hooks ───────────────────────────────────────────────────────
-	// Logger is an optional structured logger. If nil, all logging is suppressed.
-	// See the Logger interface for how to wire in zap, logrus, slog, etc.
-	Logger Logger
-}
-
-func (c Config) withDefaults() Config {
-	if c.EvaluateTimeout == 0 {
-		c.EvaluateTimeout = 5 * time.Second
-	}
-	if c.EndorseTimeout == 0 {
-		c.EndorseTimeout = 15 * time.Second
-	}
-	if c.SubmitTimeout == 0 {
-		c.SubmitTimeout = 5 * time.Second
-	}
-	if c.CommitStatusTimeout == 0 {
-		c.CommitStatusTimeout = 60 * time.Second
-	}
-	if c.Logger == nil {
-		c.Logger = noopLogger{}
-	}
-	return c
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// FabricClient
-// ─────────────────────────────────────────────────────────────────────────────
-
-// FabricClient is the top-level SDK handle. Create one with New, then call
-// Evaluate for reads and Submit for writes. Safe to share across goroutines.
+// FabricClient owns one gRPC connection to a Gateway peer and a default
+// identity and chaincode target. It is safe for concurrent use; create one
+// per peer endpoint and share it.
 type FabricClient struct {
-	cfg      Config
-	conn     *grpc.ClientConn
-	gw       *client.Gateway
-	contract *client.Contract
-	log      Logger
+	cfg       Config
+	conn      grpc.ClientConnInterface
+	ownedConn *grpc.ClientConn
+	id        *Identity
+	ownsID    bool
+	gw        *client.Gateway
+	tlsHash   []byte
+	closed    atomic.Bool
+	closeOnce sync.Once
 }
 
-// New connects to the Fabric peer and returns a ready-to-use FabricClient.
-// It opens one persistent gRPC connection and one Gateway session.
-// Always call Close() when done — use defer:
-//
-//	fc, err := fabricsdk.New(cfg)
-//	if err != nil { ... }
-//	defer fc.Close()
+// New dials the peer described by cfg and returns a ready client. The gRPC
+// connection is established lazily, on the first call.
 func New(cfg Config) (*FabricClient, error) {
+	if err := cfg.validate(true); err != nil {
+		return nil, err
+	}
 	cfg = cfg.withDefaults()
 
-	cfg.Logger.Info("fabricsdk: connecting", "peer", cfg.PeerEndpoint, "mspID", cfg.MSPID)
-
-	conn, err := newGrpcConnection(cfg)
+	creds, tlsHash, err := transportCredentials(cfg)
 	if err != nil {
-		return nil, fmt.Errorf("fabricsdk: gRPC connection failed: %w", err)
+		return nil, err
 	}
+	opts := []grpc.DialOption{grpc.WithTransportCredentials(creds)}
+	if cfg.KeepAlive != nil {
+		opts = append(opts, grpc.WithKeepaliveParams(*cfg.KeepAlive))
+	}
+	opts = append(opts, cfg.DialOptions...)
 
-	gw, err := newGateway(cfg, conn, cfg.CertPath, cfg.KeyPath)
+	conn, err := grpc.NewClient(grpcTarget(cfg.PeerEndpoint), opts...)
+	if err != nil {
+		return nil, configError(fmt.Errorf("create gRPC client: %w", err))
+	}
+	fc, err := build(cfg, conn, tlsHash)
 	if err != nil {
 		_ = conn.Close()
 		return nil, err
 	}
-
-	contract := resolveContract(gw, cfg.ChannelName, cfg.ChaincodeName, cfg.ContractName)
-
-	cfg.Logger.Info("fabricsdk: connected", "channel", cfg.ChannelName, "chaincode", cfg.ChaincodeName)
-
-	return &FabricClient{cfg: cfg, conn: conn, gw: gw, contract: contract, log: cfg.Logger}, nil
+	fc.ownedConn = conn
+	cfg.Logger.Info("fabricsdk: client ready", "peer", cfg.PeerEndpoint, "mspID", fc.id.MSPID(),
+		"channel", cfg.ChannelName, "chaincode", cfg.ChaincodeName)
+	return fc, nil
 }
 
-// Close releases the Gateway and the underlying gRPC connection.
-// Always defer Close after a successful New call.
-func (fc *FabricClient) Close() {
-	if fc.gw != nil {
-		fc.gw.Close()
+// NewWithConnection builds a client on an existing gRPC connection, for
+// example one shared with other code or an in-process test server. The
+// connection is not closed by Close. Network fields in cfg are ignored.
+func NewWithConnection(conn grpc.ClientConnInterface, cfg Config) (*FabricClient, error) {
+	if conn == nil {
+		return nil, configError(errors.New("connection is nil"))
 	}
-	if fc.conn != nil {
-		_ = fc.conn.Close()
+	if err := cfg.validate(false); err != nil {
+		return nil, err
 	}
+	return build(cfg.withDefaults(), conn, nil)
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Evaluate — read-only query
-// ─────────────────────────────────────────────────────────────────────────────
-
-// Evaluate calls a chaincode function as a read-only query.
-// The context controls timeout and cancellation — pass context.Background()
-// for no cancellation, or a context with deadline for automatic timeout.
-// The transaction is sent to one peer for execution but is never submitted to
-// the orderer and does not modify ledger state.
-// Returns the raw bytes from the chaincode response.
-//
-//	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-//	defer cancel()
-//	raw, err := fc.Evaluate(ctx, "GetAsset", "asset-1")
-//	if err != nil { ... }
-//	var asset MyAsset
-//	json.Unmarshal(raw, &asset)
-func (fc *FabricClient) Evaluate(ctx context.Context, fn string, args ...string) ([]byte, error) {
-	fc.log.Info("fabricsdk: evaluate", "fn", fn)
-	result, err := fc.contract.EvaluateTransaction(fn, args...)
-	if err != nil {
-		classified := classifyError(err)
-		fc.log.Error("fabricsdk: evaluate failed", "fn", fn, "err", classified)
-		return nil, classified
-	}
-	return result, nil
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Submit — write transaction
-// ─────────────────────────────────────────────────────────────────────────────
-
-// Submit calls a chaincode function as a write transaction.
-// The context controls timeout and cancellation for the entire lifecycle
-// (endorse + submit + commit wait). Pass context.Background() for no timeout,
-// or a context with deadline to cap the total wait.
-// It endorses the proposal, submits to the orderer, and waits for the block
-// to be committed before returning. This is equivalent to ethers.js
-// contract.someWriteFn(...) followed by tx.wait().
-// Returns the committed transaction ID on success.
-//
-//	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-//	defer cancel()
-//	txID, err := fc.Submit(ctx, "CreateAsset", string(jsonBytes))
-func (fc *FabricClient) Submit(ctx context.Context, fn string, args ...string) (string, error) {
-	fc.log.Info("fabricsdk: submit", "fn", fn)
-	txID, err := submitOnContract(ctx, fc.contract, fn, args...)
-	if err != nil {
-		fc.log.Error("fabricsdk: submit failed", "fn", fn, "err", err)
-		return "", err
-	}
-	fc.log.Info("fabricsdk: submit committed", "fn", fn, "txID", txID)
-	return txID, nil
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// WithIdentity — per-call identity override
-// ─────────────────────────────────────────────────────────────────────────────
-
-// WithIdentity returns a one-shot caller that signs transactions with the
-// provided certificate and key instead of the default identity from Config.
-// The underlying gRPC connection is reused — no new TCP/TLS handshake.
-// A new Gateway is opened for the single call and closed immediately after.
-//
-// Use this when different org members need to invoke the same chaincode:
-//
-//	ctx := context.Background()
-//	// Default user submits:
-//	txID, err := fc.Submit(ctx, "CreateAsset", string(jsonBytes))
-//
-//	// Admin submits with their own identity:
-//	txID, err = fc.WithIdentity("/admin/signcerts", "/admin/keystore").Submit(ctx, "DeleteAsset", id)
-func (fc *FabricClient) WithIdentity(certPath, keyPath string) *CallerClient {
-	return &CallerClient{parent: fc, certPath: certPath, keyPath: keyPath}
-}
-
-// CallerClient is a one-shot FabricClient view bound to a specific identity.
-// Obtain one via FabricClient.WithIdentity — do not construct directly.
-type CallerClient struct {
-	parent   *FabricClient
-	certPath string
-	keyPath  string
-}
-
-// Evaluate runs a read-only query signed by the overridden identity.
-func (cc *CallerClient) Evaluate(ctx context.Context, fn string, args ...string) ([]byte, error) {
-	var result []byte
-	err := cc.withContract(func(c *client.Contract) error {
-		var txErr error
-		result, txErr = c.EvaluateTransaction(fn, args...)
-		if txErr != nil {
-			return classifyError(txErr)
+func build(cfg Config, conn grpc.ClientConnInterface, tlsHash []byte) (*FabricClient, error) {
+	fc := &FabricClient{cfg: cfg, conn: conn, tlsHash: tlsHash}
+	fc.id = cfg.Identity
+	if fc.id == nil {
+		id, err := LoadIdentity(cfg.MSPID, cfg.CertPath, cfg.KeyPath)
+		if err != nil {
+			return nil, err
 		}
-		return nil
-	})
-	return result, err
+		fc.id, fc.ownsID = id, true
+	}
+	gw, err := fc.connect(fc.id)
+	if err != nil {
+		if fc.ownsID {
+			_ = fc.id.Close()
+		}
+		return nil, err
+	}
+	fc.gw = gw
+	return fc, nil
 }
 
-// Submit sends a write transaction signed by the overridden identity.
-func (cc *CallerClient) Submit(ctx context.Context, fn string, args ...string) (string, error) {
-	var txID string
-	err := cc.withContract(func(c *client.Contract) error {
-		var submitErr error
-		txID, submitErr = submitOnContract(ctx, c, fn, args...)
-		return submitErr
-	})
-	return txID, err
-}
-
-// withContract opens a scoped Gateway for one operation and closes it after.
-// defer gw.Close() guarantees cleanup even if fn panics.
-func (cc *CallerClient) withContract(fn func(*client.Contract) error) error {
-	gw, err := newGateway(cc.parent.cfg, cc.parent.conn, cc.certPath, cc.keyPath)
+func transportCredentials(cfg Config) (credentials.TransportCredentials, []byte, error) {
+	caPEM, err := os.ReadFile(cfg.TLSCertPath)
 	if err != nil {
-		return err
-	}
-	defer gw.Close()
-	return fn(resolveContract(gw, cc.parent.cfg.ChannelName, cc.parent.cfg.ChaincodeName, cc.parent.cfg.ContractName))
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Internal helpers
-// ─────────────────────────────────────────────────────────────────────────────
-
-func submitOnContract(ctx context.Context, c *client.Contract, fn string, args ...string) (string, error) {
-	_, commit, err := c.SubmitAsync(fn, client.WithArguments(args...))
-	if err != nil {
-		return "", classifyError(err)
-	}
-
-	st, err := commit.Status()
-	if err != nil {
-		return "", wrapSDKError(500, "failed to get commit status", err)
-	}
-	if !st.Successful {
-		return "", newSDKError(500, fmt.Sprintf(
-			"transaction %s failed to commit with status code %d",
-			st.TransactionID, int32(st.Code),
-		))
-	}
-	return commit.TransactionID(), nil
-}
-
-func resolveContract(gw *client.Gateway, channel, chaincode, contractName string) *client.Contract {
-	network := gw.GetNetwork(channel)
-	if contractName != "" {
-		return network.GetContractWithName(chaincode, contractName)
-	}
-	return network.GetContract(chaincode)
-}
-
-func newGrpcConnection(cfg Config) (*grpc.ClientConn, error) {
-	certPEM, err := os.ReadFile(cfg.TLSCertPath)
-	if err != nil {
-		return nil, fmt.Errorf("fabricsdk: read TLS cert: %w", err)
-	}
-	cert, err := identity.CertificateFromPEM(certPEM)
-	if err != nil {
-		return nil, fmt.Errorf("fabricsdk: parse TLS cert: %w", err)
+		return nil, nil, configError(fmt.Errorf("read TLS CA certificate: %w", err))
 	}
 	pool := x509.NewCertPool()
-	pool.AddCert(cert)
-
-	conn, err := grpc.Dial(
-		cfg.PeerEndpoint,
-		grpc.WithTransportCredentials(credentials.NewClientTLSFromCert(pool, cfg.PeerHostOverride)),
-	)
-	if err != nil {
-		return nil, fmt.Errorf("fabricsdk: dial peer: %w", err)
+	if !pool.AppendCertsFromPEM(caPEM) {
+		return nil, nil, configError(fmt.Errorf("no PEM certificates found in %s", cfg.TLSCertPath))
 	}
-	return conn, nil
+	tlsCfg := &tls.Config{
+		RootCAs:    pool,
+		ServerName: serverNameFor(cfg),
+		MinVersion: tls.VersionTLS12,
+	}
+	var tlsHash []byte
+	if cfg.ClientTLSCertPath != "" {
+		pair, err := tls.LoadX509KeyPair(cfg.ClientTLSCertPath, cfg.ClientTLSKeyPath)
+		if err != nil {
+			return nil, nil, configError(fmt.Errorf("load client TLS key pair: %w", err))
+		}
+		tlsCfg.Certificates = []tls.Certificate{pair}
+		sum := sha256.Sum256(pair.Certificate[0])
+		tlsHash = sum[:]
+	}
+	return credentials.NewTLS(tlsCfg), tlsHash, nil
 }
 
-func newGateway(cfg Config, conn *grpc.ClientConn, certPath, keyPath string) (*client.Gateway, error) {
-	id, err := loadIdentity(certPath, cfg.MSPID)
-	if err != nil {
-		return nil, err
-	}
-	sign, err := loadSigner(keyPath)
-	if err != nil {
-		return nil, err
-	}
-	gw, err := client.Connect(
-		id,
-		client.WithSign(sign),
+// connect creates a Gateway for id on the shared connection. This is cheap:
+// no network round trip happens until a call is made.
+func (fc *FabricClient) connect(id *Identity) (*client.Gateway, error) {
+	opts := []client.ConnectOption{
+		client.WithSign(id.sign),
 		client.WithHash(hash.SHA256),
-		client.WithClientConnection(conn),
-		client.WithEvaluateTimeout(cfg.EvaluateTimeout),
-		client.WithEndorseTimeout(cfg.EndorseTimeout),
-		client.WithSubmitTimeout(cfg.SubmitTimeout),
-		client.WithCommitStatusTimeout(cfg.CommitStatusTimeout),
-	)
+		client.WithClientConnection(fc.conn),
+		client.WithEvaluateTimeout(fc.cfg.EvaluateTimeout),
+		client.WithEndorseTimeout(fc.cfg.EndorseTimeout),
+		client.WithSubmitTimeout(fc.cfg.SubmitTimeout),
+		client.WithCommitStatusTimeout(fc.cfg.CommitStatusTimeout),
+	}
+	if len(fc.tlsHash) > 0 {
+		opts = append(opts, client.WithTLSClientCertificateHash(fc.tlsHash))
+	}
+	gw, err := client.Connect(id.x509, opts...)
 	if err != nil {
-		return nil, fmt.Errorf("fabricsdk: connect gateway: %w", err)
+		return nil, configError(fmt.Errorf("connect gateway: %w", err))
 	}
 	return gw, nil
 }
 
-func loadIdentity(certPath, mspID string) (*identity.X509Identity, error) {
-	certPEM, err := readFirstFile(certPath)
-	if err != nil {
-		return nil, fmt.Errorf("fabricsdk: read signing cert: %w", err)
-	}
-	cert, err := identity.CertificateFromPEM(certPEM)
-	if err != nil {
-		return nil, fmt.Errorf("fabricsdk: parse signing cert: %w", err)
-	}
-	id, err := identity.NewX509Identity(mspID, cert)
-	if err != nil {
-		return nil, fmt.Errorf("fabricsdk: create identity: %w", err)
-	}
-	return id, nil
+// Close releases the default Gateway, the gRPC connection (if New created it)
+// and the default identity (if the client loaded it). Safe to call twice.
+func (fc *FabricClient) Close() error {
+	var errs []error
+	fc.closeOnce.Do(func() {
+		fc.closed.Store(true)
+		if fc.gw != nil {
+			errs = append(errs, fc.gw.Close())
+		}
+		if fc.ownedConn != nil {
+			errs = append(errs, fc.ownedConn.Close())
+		}
+		if fc.ownsID {
+			errs = append(errs, fc.id.Close())
+		}
+	})
+	return errors.Join(errs...)
 }
 
-func loadSigner(keyPath string) (identity.Sign, error) {
-	keyPEM, err := readFirstFile(keyPath)
-	if err != nil {
-		return nil, fmt.Errorf("fabricsdk: read private key: %w", err)
-	}
-	pk, err := identity.PrivateKeyFromPEM(keyPEM)
-	if err != nil {
-		return nil, fmt.Errorf("fabricsdk: parse private key: %w", err)
-	}
-	sign, err := identity.NewPrivateKeySign(pk)
-	if err != nil {
-		return nil, fmt.Errorf("fabricsdk: create signer: %w", err)
-	}
-	return sign, nil
+// Identity returns the client's default identity.
+func (fc *FabricClient) Identity() *Identity { return fc.id }
+
+// Contract returns a handle for the default identity and target.
+func (fc *FabricClient) Contract() *Contract {
+	return &Contract{fc: fc, id: fc.id, channel: fc.cfg.ChannelName, chaincode: fc.cfg.ChaincodeName, contract: fc.cfg.ContractName}
 }
 
-// readFirstFile reads the single file inside a Fabric MSP directory
-// (signcerts or keystore). These directories conventionally hold one file.
-func readFirstFile(dirPath string) ([]byte, error) {
-	dir, err := os.Open(dirPath)
-	if err != nil {
-		return nil, err
-	}
-	defer dir.Close()
+// Target returns a handle for another channel, chaincode or contract, using
+// the default identity. contractName may be empty for the default contract.
+func (fc *FabricClient) Target(channel, chaincode, contractName string) *Contract {
+	return fc.Contract().WithTarget(channel, chaincode, contractName)
+}
 
-	names, err := dir.Readdirnames(1)
-	if err != nil {
-		return nil, err
+// WithIdentity returns a handle that signs with id on the default target.
+func (fc *FabricClient) WithIdentity(id *Identity) *Contract {
+	return fc.Contract().WithIdentity(id)
+}
+
+// Evaluate runs a read-only query with the default identity and target.
+func (fc *FabricClient) Evaluate(ctx context.Context, fn string, args ...string) ([]byte, error) {
+	return fc.Contract().Evaluate(ctx, fn, args...)
+}
+
+// EvaluateWith runs a read-only query with call options.
+func (fc *FabricClient) EvaluateWith(ctx context.Context, fn string, opts ...CallOption) ([]byte, error) {
+	return fc.Contract().EvaluateWith(ctx, fn, opts...)
+}
+
+// Submit endorses, orders and waits for the commit of a transaction.
+func (fc *FabricClient) Submit(ctx context.Context, fn string, args ...string) (*TxResult, error) {
+	return fc.Contract().Submit(ctx, fn, args...)
+}
+
+// SubmitWith is Submit with call options (transient data, endorsing orgs).
+func (fc *FabricClient) SubmitWith(ctx context.Context, fn string, opts ...CallOption) (*TxResult, error) {
+	return fc.Contract().SubmitWith(ctx, fn, opts...)
+}
+
+// SubmitAsync endorses and orders a transaction and returns without waiting
+// for the commit.
+func (fc *FabricClient) SubmitAsync(ctx context.Context, fn string, opts ...CallOption) (*PendingTx, error) {
+	return fc.Contract().SubmitAsync(ctx, fn, opts...)
+}
+
+// TxStatus looks up a transaction on the default channel.
+func (fc *FabricClient) TxStatus(ctx context.Context, txID string) (*TxStatus, error) {
+	return fc.Contract().TxStatus(ctx, txID)
+}
+
+// Height returns the block height of the default channel on the Gateway peer.
+func (fc *FabricClient) Height(ctx context.Context) (uint64, error) {
+	return fc.Contract().Height(ctx)
+}
+
+// ── call options ─────────────────────────────────────────────────────────────
+
+// CallOption customises one Evaluate or Submit call.
+type CallOption func(*callOptions)
+
+type callOptions struct {
+	args      [][]byte
+	transient map[string][]byte
+	orgs      []string
+}
+
+// Args appends string arguments.
+func Args(args ...string) CallOption {
+	return func(o *callOptions) {
+		for _, a := range args {
+			o.args = append(o.args, []byte(a))
+		}
 	}
-	if len(names) == 0 {
-		return nil, fmt.Errorf("no files in directory: %s", dirPath)
+}
+
+// BytesArgs appends raw byte arguments.
+func BytesArgs(args ...[]byte) CallOption {
+	return func(o *callOptions) { o.args = append(o.args, args...) }
+}
+
+// Transient sets transient data: inputs that reach the endorsing peers but
+// are not written to the block. Use it for private data and personal data.
+func Transient(data map[string][]byte) CallOption {
+	return func(o *callOptions) { o.transient = data }
+}
+
+// EndorsingOrgs restricts endorsement to the given MSP IDs. Only needed when
+// the Gateway's own org cannot endorse a proposal carrying transient data, or
+// for blind writes to a private collection. Otherwise let the Gateway choose.
+func EndorsingOrgs(mspIDs ...string) CallOption {
+	return func(o *callOptions) { o.orgs = append(o.orgs, mspIDs...) }
+}
+
+func proposalOptions(opts []CallOption) []client.ProposalOption {
+	var o callOptions
+	for _, opt := range opts {
+		opt(&o)
 	}
-	return os.ReadFile(path.Join(dirPath, names[0]))
+	out := []client.ProposalOption{client.WithBytesArguments(o.args...)}
+	if o.transient != nil {
+		out = append(out, client.WithTransient(o.transient))
+	}
+	if len(o.orgs) > 0 {
+		out = append(out, client.WithEndorsingOrganizations(o.orgs...))
+	}
+	return out
+}
+
+// withDefaultTimeout bounds ctx by d unless ctx already has a deadline.
+func withDefaultTimeout(ctx context.Context, d time.Duration) (context.Context, context.CancelFunc) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if _, ok := ctx.Deadline(); ok || d <= 0 {
+		return context.WithCancel(ctx)
+	}
+	return context.WithTimeout(ctx, d)
 }
